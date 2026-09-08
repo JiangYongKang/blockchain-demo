@@ -117,7 +117,7 @@ def test_proposal_validation():
     key = KeyPair.generate()
     proposal = make_proposal(key, _block(key), 0)
     assert validate_proposal(proposal)
-    proposal["block"]["timestamp"] = 2.0  # changes block hash
+    proposal["block"]["header"]["timestamp"] = 2.0  # changes block hash
     assert not validate_proposal(proposal)
 
 

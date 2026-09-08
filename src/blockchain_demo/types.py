@@ -24,6 +24,7 @@ from .crypto import (
     verify,
     verify_ecdsa,
 )
+from .merkle import merkle_root
 
 CHAIN_ID = "blockchain-demo-local"
 
@@ -34,64 +35,138 @@ PRECOMMIT = "precommit"
 # Fraction of a double-signing validator's stake that is slashed (1/2).
 SLASH_NUM, SLASH_DEN = 1, 2
 
-# Fields of a transaction that are covered by the ECDSA signature.
-TX_FIELDS = ("sender", "recipient", "amount", "nonce", "pubkey")
+# Transaction kinds. A **transfer** moves funds between externally-owned
+# accounts; a **deploy** creates a contract account (with code); a **call**
+# invokes a contract, optionally transferring value and/or writing storage.
+TRANSFER = "transfer"
+DEPLOY = "deploy"
+CALL = "call"
+TX_KINDS = (TRANSFER, DEPLOY, CALL)
 
 
 # ---------------------------------------------------------------- transactions
+def _sign_tx(key: AccountKey, body: dict) -> dict:
+    tx = dict(body)
+    tx["signature"] = key.sign(canonical({"chain_id": CHAIN_ID, "tx": body}))
+    return tx
+
+
 def make_tx(key: AccountKey, recipient: str, amount: int, nonce: int) -> dict:
-    """Build a signed transfer transaction.
+    """Build a signed **transfer** transaction.
 
     `sender` is the signer's account address (derived from its public key);
     the public key is embedded so any node can derive the address and verify
     the ECDSA signature without prior knowledge of the account.
     """
     body = {
+        "kind": TRANSFER,
         "sender": key.address,
         "recipient": recipient,
         "amount": amount,
         "nonce": nonce,
         "pubkey": key.public_hex,
     }
-    tx = dict(body)
-    tx["signature"] = key.sign(canonical({"chain_id": CHAIN_ID, "tx": body}))
-    return tx
+    return _sign_tx(key, body)
+
+
+def make_deploy_tx(key: AccountKey, code_hex: str, nonce: int) -> dict:
+    """Build a signed **contract-deployment** transaction.
+
+    The contract's address is derived deterministically from the creator and
+    its account nonce at application time (see `contract.contract_address`);
+    the deployed `code_hex` is stored on that new contract account.
+    """
+    body = {
+        "kind": DEPLOY,
+        "sender": key.address,
+        "code": code_hex,
+        "nonce": nonce,
+        "pubkey": key.public_hex,
+    }
+    return _sign_tx(key, body)
+
+
+def make_call_tx(
+    key: AccountKey, contract: str, nonce: int, calldata: int = 0, amount: int = 0
+) -> dict:
+    """Build a signed **contract-call** transaction.
+
+    `calldata` is a single word pushed onto the VM stack (e.g. the value to
+    store in a counter); `amount` is an optional value transfer to the
+    contract. The contract code runs against its storage during application.
+    """
+    body = {
+        "kind": CALL,
+        "sender": key.address,
+        "contract": contract,
+        "calldata": calldata,
+        "amount": amount,
+        "nonce": nonce,
+        "pubkey": key.public_hex,
+    }
+    return _sign_tx(key, body)
+
+
+def tx_kind(tx: dict) -> str:
+    return tx.get("kind", TRANSFER)
 
 
 def tx_sign_bytes(tx: dict) -> bytes:
-    body = {k: tx[k] for k in TX_FIELDS}
+    """Canonical bytes covered by the ECDSA signature, per transaction kind."""
+    kind = tx_kind(tx)
+    if kind == DEPLOY:
+        fields = ("kind", "sender", "code", "nonce", "pubkey")
+    elif kind == CALL:
+        fields = ("kind", "sender", "contract", "calldata", "amount", "nonce", "pubkey")
+    else:  # transfer
+        fields = ("kind", "sender", "recipient", "amount", "nonce", "pubkey")
+    body = {f: tx[f] for f in fields if f in tx}
     return canonical({"chain_id": CHAIN_ID, "tx": body})
+
+
+def _is_int(x) -> bool:
+    return isinstance(x, int) and not isinstance(x, bool)
 
 
 def validate_tx(tx: dict) -> bool:
     """Structural + ECDSA signature validation for a transaction.
 
-    State-dependent checks (nonce match, sufficient balance) are enforced
-    separately by the state machine; this covers everything verifiable
-    without state: well-formed fields, valid secp256k1 public key, address
-    binding, and a valid low-S ECDSA signature over chain_id + tx body.
+    State-dependent checks (nonce match, sufficient balance, contract
+    existence / successful execution) are enforced separately by the state
+    machine; this covers everything verifiable without state: well-formed
+    fields per kind, a valid secp256k1 public key bound to `sender`, and a
+    valid low-S ECDSA signature over chain_id + the tx body.
     """
     try:
-        # Shape / types.
-        if not isinstance(tx.get("amount"), int) or isinstance(tx["amount"], bool):
+        kind = tx_kind(tx)
+        if kind not in TX_KINDS:
             return False
-        if tx["amount"] <= 0:
-            return False
-        if not isinstance(tx.get("nonce"), int) or isinstance(tx["nonce"], bool):
-            return False
-        if tx["nonce"] < 0:
-            return False
-        if not isinstance(tx.get("sender"), str) or not tx["sender"]:
-            return False
-        if not isinstance(tx.get("recipient"), str) or not tx["recipient"]:
-            return False
-        if not isinstance(tx.get("pubkey"), str) or not tx["pubkey"]:
-            return False
-        if not isinstance(tx.get("signature"), str) or not tx["signature"]:
+        # Common shape.
+        for f in ("sender", "pubkey", "signature"):
+            if not isinstance(tx.get(f), str) or not tx[f]:
+                return False
+        if not _is_int(tx.get("nonce")) or tx["nonce"] < 0:
             return False
         # The embedded public key must hash to the claimed sender address.
         if address_from_pubkey(tx["pubkey"]) != tx["sender"]:
             return False
+        # Per-kind shape.
+        if kind == TRANSFER:
+            if not _is_int(tx.get("amount")) or tx["amount"] <= 0:
+                return False
+            if not isinstance(tx.get("recipient"), str) or not tx["recipient"]:
+                return False
+        elif kind == DEPLOY:
+            if not isinstance(tx.get("code"), str) or not tx["code"]:
+                return False
+            bytes.fromhex(tx["code"])  # must be valid hex bytecode
+        else:  # call
+            if not isinstance(tx.get("contract"), str) or not tx["contract"]:
+                return False
+            if not _is_int(tx.get("calldata", 0)) or tx["calldata"] < 0:
+                return False
+            if not _is_int(tx.get("amount", 0)) or tx["amount"] < 0:
+                return False
         # The ECDSA signature must verify against that public key.
         return verify_ecdsa(tx["pubkey"], tx_sign_bytes(tx), tx["signature"])
     except (KeyError, TypeError, ValueError):
@@ -99,6 +174,25 @@ def validate_tx(tx: dict) -> bool:
 
 
 # ---------------------------------------------------------------------- blocks
+# Fields hashed into the block identity (the "block header"). The body — the
+# full transaction and evidence lists — is NOT hashed directly; instead the
+# header commits to `txs_root` / `evidence_root` (Merkle roots over those
+# lists) and to `app_state_root` (the state trie root AFTER applying the
+# block). A light client therefore needs only the header to identify the block
+# and the state it finalizes, plus Merkle proofs for any account/storage value
+# it wants to read.
+HEADER_FIELDS = (
+    "height",
+    "round",
+    "prev_hash",
+    "timestamp",
+    "proposer",
+    "txs_root",
+    "evidence_root",
+    "app_state_root",
+)
+
+
 def make_block(
     height: int,
     round_: int,
@@ -107,20 +201,49 @@ def make_block(
     proposer: str,
     txs: list[dict],
     evidence: list[dict],
+    app_state_root: str = "",
 ) -> dict:
-    return {
+    """Build a block.
+
+    `app_state_root` is the state trie root after applying `txs`/`evidence`;
+    the proposer computes it over a dry-run and places it in the header. The
+    header also binds Merkle roots over the tx and evidence lists, so the body
+    cannot be altered without changing the block hash.
+    """
+    header = {
         "height": height,
         "round": round_,
         "prev_hash": prev_hash,
         "timestamp": timestamp,
         "proposer": proposer,
-        "txs": txs,
-        "evidence": evidence,
+        "txs_root": merkle_root([hash_obj(tx) for tx in txs]),
+        "evidence_root": merkle_root([hash_obj(ev) for ev in evidence]),
+        "app_state_root": app_state_root,
     }
+    return {"header": header, "txs": txs, "evidence": evidence}
+
+
+def block_header(block: dict) -> dict:
+    return block["header"]
 
 
 def block_hash(block: dict) -> str:
-    return hash_obj(block)
+    """The block identity is the hash of its header only.
+
+    The header commits to the body via Merkle roots and to the resulting state
+    via `app_state_root`, so hashing the header binds everything.
+    """
+    return hash_obj({k: block["header"][k] for k in HEADER_FIELDS})
+
+
+def block_body_matches_header(block: dict) -> bool:
+    """Check that the tx/evidence bodies match the roots in the header."""
+    h = block["header"]
+    return (
+        h.get("txs_root") == merkle_root([hash_obj(tx) for tx in block.get("txs", [])])
+        and h.get("evidence_root")
+        == merkle_root([hash_obj(ev) for ev in block.get("evidence", [])])
+    )
 
 
 # ----------------------------------------------------------------------- votes
@@ -162,7 +285,7 @@ def make_proposal(key: KeyPair, block: dict, round_: int) -> dict:
     field (it is part of the block hash), while the proposal must carry the
     round it is broadcast in.
     """
-    body = {"height": block["height"], "round": round_, "block_hash": block_hash(block)}
+    body = {"height": block["header"]["height"], "round": round_, "block_hash": block_hash(block)}
     return {
         **body,
         "block": block,
@@ -185,7 +308,7 @@ def validate_proposal(proposal: dict) -> bool:
         # `proposer` field is informational only: a validator locked on a
         # block re-proposes the ORIGINAL block (created by someone else) in a
         # later round, signed with its own key — that must remain valid.
-        if block["height"] != proposal["height"]:
+        if block["header"]["height"] != proposal["height"]:
             return False
         return verify(proposal["proposer"], proposal_sign_bytes(proposal), proposal["signature"])
     except (KeyError, TypeError):

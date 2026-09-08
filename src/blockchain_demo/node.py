@@ -16,6 +16,7 @@ from .crypto import KeyPair
 from .network import Network, Peer
 from .state import ChainState, StateError
 from .types import (
+    block_body_matches_header,
     block_hash,
     evidence_culprit,
     evidence_key,
@@ -79,7 +80,7 @@ class Node:
             self.chain_state.apply_block(record["block"])
             self.blocks.append(record["block"])
             self.last_block_hash = block_hash(record["block"])
-            self.height = record["block"]["height"] + 1
+            self.height = record["block"]["header"]["height"] + 1
         if self.height:
             self.log(f"loaded {self.height} blocks from disk")
 
@@ -93,7 +94,7 @@ class Node:
             return False, "invalid signature or shape"
         if tx["nonce"] != self.chain_state.nonces.get(tx["sender"], 0):
             return False, "bad nonce"
-        if self.chain_state.balances.get(tx["sender"], 0) < tx["amount"]:
+        if self.chain_state.balances.get(tx["sender"], 0) < tx.get("amount", 0):
             return False, "insufficient funds"
         if not any(t["signature"] == tx["signature"] for t in self.mempool):
             self.mempool.append(tx)
@@ -132,45 +133,67 @@ class Node:
 
     # ------------------------------------------------------------------- commit
     def commit_block(self, block: dict, commits: list[dict]) -> None:
-        if block["height"] != self.height:
+        header = block["header"]
+        if header["height"] != self.height:
             return  # stale or already committed
-        if block["prev_hash"] != self.last_block_hash:
-            self.log(f"refusing block h={block['height']}: prev_hash mismatch")
+        if header["prev_hash"] != self.last_block_hash:
+            self.log(f"refusing block h={header['height']}: prev_hash mismatch")
             return
-        # Defense in depth: never apply a block whose transactions or
-        # evidence do not execute cleanly against our current state. An
-        # invalid tx (bad signature / nonce / funds) makes the whole block
-        # invalid, so it can never be finalized on an honest node — and a
-        # block that fails here cannot have earned honest precommits anyway
-        # (honest validators prevote nil for blocks that fail dry-run).
+        # Defense in depth: never apply a block whose body does not match its
+        # header, whose transactions/evidence do not execute cleanly, or whose
+        # committed state root differs from the state we derive. An invalid tx
+        # (bad signature / nonce / funds / contract fault) or a lying state root
+        # makes the whole block invalid, so it can never be finalized on an
+        # honest node — and such a block cannot have earned honest precommits
+        # anyway (honest validators prevote nil for blocks that fail these checks).
         try:
-            self.chain_state.dry_run_block(block)
+            if not block_body_matches_header(block):
+                raise StateError("block body does not match header roots")
+            post = self.chain_state.dry_run_block(block)
+            if post.state_root() != header["app_state_root"]:
+                raise StateError("app_state_root mismatch")
         except StateError as exc:
-            self.log(f"refusing block h={block['height']}: {exc}")
+            self.log(f"refusing block h={header['height']}: {exc}")
             return
-        self.chain_state.apply_block(block)
+        self.chain_state = post
         included = {t["signature"] for t in block["txs"]}
         self.mempool = [t for t in self.mempool if t["signature"] not in included]
         for ev in block["evidence"]:
             self.evidence_pool.pop(evidence_key(ev), None)
         self.blocks.append(block)
         self.last_block_hash = block_hash(block)
-        self.height = block["height"] + 1
+        self.height = header["height"] + 1
         self._persist(block, commits)
         self.log(
-            f"COMMIT h={block['height']} block={self.last_block_hash[:8]} "
+            f"COMMIT h={header['height']} block={self.last_block_hash[:8]} "
+            f"state={header['app_state_root'][:8]} "
             f"txs={len(block['txs'])} evidence={len(block['evidence'])}"
         )
         for tx in block["txs"]:
-            self.log(
-                f"  transfer {tx['sender'][:8]} -> {tx['recipient'][:8]} "
-                f"amount={tx['amount']} (nonce {tx['nonce']})"
-            )
+            self._log_tx(tx)
         for ev in block["evidence"]:
             culprit = evidence_culprit(ev)
             stake = self.chain_state.validators.get(culprit, 0)
             self.log(f"SLASHED {culprit[:8]} for double-signing; stake now {stake}")
         self.consensus.start_height(self.height)
+
+    def _log_tx(self, tx: dict) -> None:
+        kind = tx.get("kind", "transfer")
+        if kind == "deploy":
+            from .contract import contract_address
+
+            addr = contract_address(tx["sender"], tx["nonce"])
+            self.log(f"  deploy   {tx['sender'][:8]} -> contract {addr[:8]} ({len(tx['code'])//2} bytes)")
+        elif kind == "call":
+            self.log(
+                f"  call     {tx['sender'][:8]} -> {tx['contract'][:8]} "
+                f"calldata={tx.get('calldata', 0)} amount={tx.get('amount', 0)}"
+            )
+        else:
+            self.log(
+                f"  transfer {tx['sender'][:8]} -> {tx['recipient'][:8]} "
+                f"amount={tx['amount']} (nonce {tx['nonce']})"
+            )
 
     # --------------------------------------------------------------------- sync
     def maybe_sync(self) -> None:
@@ -198,7 +221,7 @@ class Node:
             if not line.strip():
                 continue
             rec = json.loads(line)
-            if rec["block"]["height"] >= start:
+            if rec["block"]["header"]["height"] >= start:
                 out.append(rec)
                 if len(out) >= limit:
                     break
@@ -207,9 +230,9 @@ class Node:
     def _handle_sync_response(self, data: dict) -> None:
         for rec in data.get("records", []):
             block, commits = rec["block"], rec["commits"]
-            if block["height"] != self.height:
+            if block["header"]["height"] != self.height:
                 continue
-            if block["prev_hash"] != self.last_block_hash:
+            if block["header"]["prev_hash"] != self.last_block_hash:
                 continue
             if not self._verify_commits(block, commits):
                 self.log("sync: rejected block with invalid commit proof")
@@ -225,7 +248,7 @@ class Node:
         for vote in commits:
             if not validate_vote(vote):
                 return False
-            if vote["type"] != "precommit" or vote["height"] != block["height"]:
+            if vote["type"] != "precommit" or vote["height"] != block["header"]["height"]:
                 return False
             if vote["block_hash"] != target or vote["validator"] in seen:
                 return False
@@ -296,16 +319,18 @@ class Node:
         if cmd == "balances":
             return {"ok": True, "balances": dict(self.chain_state.balances)}
         if cmd == "accounts":
-            # Full account view: address -> {balance, nonce}. Only addresses
-            # with a balance are tracked; nonce defaults to 0 for unknown
-            # addresses (the state machine treats them the same way).
-            addrs = set(self.chain_state.balances) | set(self.chain_state.nonces)
+            # Full account view: address -> {balance, nonce, code (contracts),
+            # storage_root}. Unknown addresses default to balance/nonce 0.
+            st = self.chain_state
+            addrs = set(st.balances) | set(st.nonces) | set(st.codes)
             return {
                 "ok": True,
                 "accounts": {
                     a: {
-                        "balance": self.chain_state.balances.get(a, 0),
-                        "nonce": self.chain_state.nonces.get(a, 0),
+                        "balance": st.balances.get(a, 0),
+                        "nonce": st.nonces.get(a, 0),
+                        "code": st.codes.get(a, ""),
+                        "storage_root": st.storage_root(a),
                     }
                     for a in sorted(addrs)
                 },
@@ -315,10 +340,39 @@ class Node:
         if cmd == "block":
             h = int(req.get("height", self.height - 1))
             for rec in self._read_chain_records(h, limit=1_000_000):
-                if rec["block"]["height"] == h:
+                if rec["block"]["header"]["height"] == h:
                     return {"ok": True, "record": rec}
             return {"ok": False, "error": "not found"}
+        if cmd in ("prove_account", "prove_storage"):
+            return self._rpc_prove(cmd, req)
         return {"ok": False, "error": f"unknown command {cmd!r}"}
+
+    def _rpc_prove(self, cmd: str, req: dict) -> dict:
+        """Serve a state proof bound to the latest finalized block.
+
+        Returns the block header (which commits `app_state_root`), the >2/3
+        precommit votes that finalize it, and the Merkle proof. A light client
+        verifies finality from the votes, takes `app_state_root` from the
+        header, and checks the proof against it — it never trusts this node for
+        the account/storage value itself.
+        """
+        latest = None
+        for rec in self._read_chain_records(0, limit=1_000_000):
+            latest = rec
+        if latest is None:
+            return {"ok": False, "error": "no finalized block yet"}
+        st = self.chain_state
+        if cmd == "prove_account":
+            proof = st.account_proof(req.get("address", ""))
+        else:
+            proof = st.storage_proof(req.get("address", ""), req.get("slot", "0"))
+        return {
+            "ok": True,
+            "header": latest["block"]["header"],
+            "block_hash": block_hash(latest["block"]),
+            "commits": latest["commits"],
+            "proof": proof,
+        }
 
     # ---------------------------------------------------------------------- run
     async def run(self) -> None:

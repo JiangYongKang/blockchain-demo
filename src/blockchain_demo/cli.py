@@ -20,9 +20,11 @@ import sys
 from pathlib import Path
 
 from .crypto import AccountKey, KeyPair
+from .contract import contract_address, word_hex
+from . import light
 from .node import Node
 from .state import GENESIS_BALANCE, GENESIS_STAKE
-from .types import CHAIN_ID, make_tx
+from .types import CHAIN_ID, make_call_tx, make_deploy_tx, make_tx
 
 BASE_DIR = Path(".chain-data")
 P2P_BASE = 26660
@@ -139,24 +141,126 @@ def cmd_stop_all(args: argparse.Namespace) -> None:
     print("stopped all validator processes")
 
 
+def _load_account(base: Path, idx: int) -> AccountKey:
+    return AccountKey.from_dict(
+        json.loads((base / "accounts" / f"acc{idx}.json").read_text())
+    )
+
+
+def _resolve_address(base: Path, ref: str) -> str:
+    """Resolve `accN` to that account's address; pass a hex address through."""
+    if ref.startswith("acc") and ref[3:].isdigit():
+        return _load_account(base, int(ref[3:])).address
+    return ref
+
+
+def _get_nonce(configs: dict, node: int, address: str) -> int:
+    resp = asyncio.run(
+        rpc_call(configs[node]["rpc_port"], {"cmd": "nonce", "address": address})
+    )
+    return resp.get("nonce", 0)
+
+
 def cmd_tx(args: argparse.Namespace) -> None:
     base = Path(args.dir)
     configs = load_configs(base)
-    sender = AccountKey.from_dict(
-        json.loads((base / "accounts" / f"acc{args.sender}.json").read_text())
-    )
-    recipient = AccountKey.from_dict(
-        json.loads((base / "accounts" / f"acc{args.recipient}.json").read_text())
-    )
-    nonce_resp = asyncio.run(
-        rpc_call(configs[args.node]["rpc_port"], {"cmd": "nonce", "address": sender.address})
-    )
-    nonce = nonce_resp.get("nonce", 0)
+    sender = _load_account(base, args.sender)
+    recipient = _load_account(base, args.recipient)
+    nonce = _get_nonce(configs, args.node, sender.address)
     tx = make_tx(sender, recipient.address, args.amount, nonce)
     result = asyncio.run(
         rpc_call(configs[args.node]["rpc_port"], {"cmd": "submit_tx", "tx": tx})
     )
     print(json.dumps(result))
+
+
+def cmd_deploy(args: argparse.Namespace) -> None:
+    """Deploy a contract. Prints the derived contract address (deterministic)."""
+    base = Path(args.dir)
+    configs = load_configs(base)
+    sender = _load_account(base, args.sender)
+    nonce = _get_nonce(configs, args.node, sender.address)
+    addr = contract_address(sender.address, nonce)
+    tx = make_deploy_tx(sender, args.code, nonce)
+    result = asyncio.run(
+        rpc_call(configs[args.node]["rpc_port"], {"cmd": "submit_tx", "tx": tx})
+    )
+    print(json.dumps({**result, "contract": addr}))
+
+
+def cmd_call(args: argparse.Namespace) -> None:
+    """Invoke a contract: `--to` is a hex contract address or `accN`."""
+    base = Path(args.dir)
+    configs = load_configs(base)
+    sender = _load_account(base, args.sender)
+    contract = _resolve_address(base, args.to)
+    nonce = _get_nonce(configs, args.node, sender.address)
+    tx = make_call_tx(sender, contract, nonce, calldata=args.calldata, amount=args.amount)
+    result = asyncio.run(
+        rpc_call(configs[args.node]["rpc_port"], {"cmd": "submit_tx", "tx": tx})
+    )
+    print(json.dumps(result))
+
+
+def cmd_proof(args: argparse.Namespace) -> None:
+    """Fetch a state proof and verify it as a light client, locally.
+
+    Trusts only the genesis validator set (public keys in genesis.json) and the
+    block header + precommit votes + Merkle proof returned by the node — never
+    the node's stated value. Prints VERIFIED with the proven value, or REJECTED.
+    """
+    base = Path(args.dir)
+    configs = load_configs(base)
+    port = configs[args.node]["rpc_port"]
+    genesis = load_genesis(base)
+    validators = dict(genesis["validators"])  # the light client's trusted set
+
+    address = _resolve_address(base, args.address)
+    if args.what == "balance":
+        resp = asyncio.run(rpc_call(port, {"cmd": "prove_account", "address": address}))
+        if not resp.get("ok"):
+            print(f"REJECTED: {resp.get('error')}")
+            return
+        result = light.verify_account(
+            resp["header"], resp["commits"], validators, address, resp["proof"]
+        )
+        if result is None:
+            print("REJECTED: finality or account proof failed verification")
+            return
+        print(
+            f"VERIFIED final block h={resp['header']['height']} "
+            f"state={resp['header']['app_state_root'][:16]}…"
+        )
+        if result["exists"]:
+            kind = "contract" if result["code"] else "account"
+            print(
+                f"  {kind} {address[:16]}… balance={result['balance']} "
+                f"nonce={result['nonce']} storage_root={result['storage_root'][:16]}…"
+            )
+        else:
+            print(f"  account {address[:16]}… does NOT exist in this state (proven absence)")
+    else:  # storage slot
+        slot = word_hex(int(args.slot, 0))
+        resp = asyncio.run(
+            rpc_call(port, {"cmd": "prove_storage", "address": address, "slot": slot})
+        )
+        if not resp.get("ok"):
+            print(f"REJECTED: {resp.get('error')}")
+            return
+        result = light.verify_storage(
+            resp["header"], resp["commits"], validators, address, slot, resp["proof"]
+        )
+        if result is None:
+            print("REJECTED: finality or storage proof failed verification")
+            return
+        print(
+            f"VERIFIED final block h={resp['header']['height']} "
+            f"state={resp['header']['app_state_root'][:16]}…"
+        )
+        print(
+            f"  contract {address[:16]}… slot 0x{int(slot,16):x} = "
+            f"0x{int(result['value'],16):x} ({int(result['value'],16)})"
+        )
 
 
 def cmd_balances(args: argparse.Namespace) -> None:
@@ -245,6 +349,30 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--amount", type=int, required=True)
     sp.add_argument("--node", type=int, default=0, help="node to submit through")
     sp.set_defaults(fn=cmd_tx)
+
+    sp = sub.add_parser("deploy", help="deploy contract bytecode from a demo account")
+    sp.add_argument("--from", dest="sender", type=int, required=True)
+    sp.add_argument("--code", type=str, required=True, help="hex bytecode, e.g. 0060ff")
+    sp.add_argument("--node", type=int, default=0)
+    sp.set_defaults(fn=cmd_deploy)
+
+    sp = sub.add_parser("call", help="invoke a contract (calldata word, optional value)")
+    sp.add_argument("--from", dest="sender", type=int, required=True)
+    sp.add_argument("--to", dest="to", type=str, required=True, help="contract hex address")
+    sp.add_argument("--calldata", type=lambda s: int(s, 0), default=0)
+    sp.add_argument("--amount", type=int, default=0)
+    sp.add_argument("--node", type=int, default=0)
+    sp.set_defaults(fn=cmd_call)
+
+    sp = sub.add_parser(
+        "proof",
+        help="fetch a light-client proof for an account balance or storage slot and verify it",
+    )
+    sp.add_argument("what", choices=("balance", "storage"))
+    sp.add_argument("--address", type=str, required=True, help="hex address or accN")
+    sp.add_argument("--slot", type=str, default="0", help="storage slot (hex or decimal)")
+    sp.add_argument("--node", type=int, default=0)
+    sp.set_defaults(fn=cmd_proof)
 
     sp = sub.add_parser("status", help="print height/validators/slashing for all nodes")
     sp.set_defaults(fn=cmd_status)

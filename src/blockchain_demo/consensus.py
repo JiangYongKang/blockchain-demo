@@ -16,6 +16,7 @@ All handlers run on the node's single asyncio loop, so no locking is needed.
 from __future__ import annotations
 
 import asyncio
+import copy
 import time
 from collections import defaultdict
 from typing import TYPE_CHECKING, Optional
@@ -23,6 +24,7 @@ from typing import TYPE_CHECKING, Optional
 from .types import (
     PRECOMMIT,
     PREVOTE,
+    block_body_matches_header,
     block_hash,
     make_block,
     make_evidence,
@@ -156,14 +158,31 @@ class Consensus:
         if self.locked_hash is not None and self.locked_hash in self.blocks_by_hash:
             block = self.blocks_by_hash[self.locked_hash]  # re-propose locked block
         else:
-            block = make_block(
+            txs = self.node.mempool_snapshot(limit=100)
+            evidence = self.node.evidence_snapshot(limit=10)
+            # Compute the post-block state root over a dry-run and commit it in
+            # the header. Every honest validator recomputes this and rejects a
+            # header whose root does not match the state they derive, so a
+            # proposer cannot lie about the resulting state.
+            candidate = make_block(
                 height=self.height,
                 round_=self.round,
                 prev_hash=self.node.last_block_hash,
                 timestamp=time.time(),
                 proposer=self.me,
-                txs=self.node.mempool_snapshot(limit=100),
-                evidence=self.node.evidence_snapshot(limit=10),
+                txs=txs,
+                evidence=evidence,
+            )
+            app_state_root = self.state.dry_run_block(candidate).state_root()
+            block = make_block(
+                height=self.height,
+                round_=self.round,
+                prev_hash=self.node.last_block_hash,
+                timestamp=candidate["header"]["timestamp"],
+                proposer=self.me,
+                txs=txs,
+                evidence=evidence,
+                app_state_root=app_state_root,
             )
         proposal = make_proposal(self.node.key, block, self.round)
         self.log(f"proposing block {block_hash(block)[:8]} ({len(block['txs'])} txs)")
@@ -174,8 +193,11 @@ class Consensus:
 
     def _byzantine_double_propose(self, block: dict) -> None:
         """Byzantine behavior: sign and broadcast a conflicting second proposal."""
-        evil = dict(block)
-        evil["timestamp"] = block["timestamp"] + 0.0001  # different content -> different hash
+        evil = copy.deepcopy(block)
+        # Different content -> different hash. Keep the body identical but bump
+        # the timestamp; the committed state root stays consistent enough for a
+        # second valid-looking proposal (honest nodes still only commit one).
+        evil["header"]["timestamp"] = block["header"]["timestamp"] + 0.0001
         proposal = make_proposal(self.node.key, evil, self.round)
         self.log(f"BYZANTINE: double-proposing {block_hash(evil)[:8]}")
         self._broadcast({"type": "proposal", "data": proposal})
@@ -207,16 +229,30 @@ class Consensus:
         if rnd == self.round and self.step == PROPOSE:
             self._maybe_prevote(rnd)
 
+    def _block_is_valid(self, block: dict) -> bool:
+        """Full validity check an honest validator runs before voting for a block.
+
+        The block must (a) have a body whose tx/evidence lists match the Merkle
+        roots in its header, and (b) execute cleanly against our state — and the
+        state root we derive from executing it MUST equal the `app_state_root`
+        the proposer committed in the header. A mismatched root means the
+        proposer is lying about the resulting state (or the header was altered),
+        so we prevote nil exactly as for an invalid transaction.
+        """
+        try:
+            if not block_body_matches_header(block):
+                return False
+            post = self.state.dry_run_block(block)
+            return post.state_root() == block["header"]["app_state_root"]
+        except Exception:
+            return False
+
     def _maybe_prevote(self, round_: int) -> None:
         proposal = self.proposals.get(round_)
         if proposal is None or self.step != PROPOSE:
             return
         h = proposal["block_hash"]
-        try:
-            self.state.dry_run_block(proposal["block"])
-            valid = True
-        except Exception:
-            valid = False
+        valid = self._block_is_valid(proposal["block"])
         if not valid:
             self._prevote(None)
         elif self.locked_round == -1 or self.locked_hash == h:
