@@ -3,13 +3,27 @@
 Everything is a plain dict at the wire level; these helpers build, sign,
 hash and validate them. Canonical sign-bytes always include the chain id so
 signatures cannot be replayed across networks.
+
+* Transactions are **account model** transfers signed with **secp256k1
+  ECDSA** (`AccountKey`): the tx carries the sender's public key, the sender
+  address is derived from it, and the signature proves ownership.
+* Consensus messages (votes/proposals) are signed by validators with
+  Ed25519 (`KeyPair`).
 """
 
 from __future__ import annotations
 
 from typing import Any, Optional
 
-from .crypto import KeyPair, canonical, hash_obj, verify
+from .crypto import (
+    AccountKey,
+    KeyPair,
+    address_from_pubkey,
+    canonical,
+    hash_obj,
+    verify,
+    verify_ecdsa,
+)
 
 CHAIN_ID = "blockchain-demo-local"
 
@@ -20,28 +34,67 @@ PRECOMMIT = "precommit"
 # Fraction of a double-signing validator's stake that is slashed (1/2).
 SLASH_NUM, SLASH_DEN = 1, 2
 
+# Fields of a transaction that are covered by the ECDSA signature.
+TX_FIELDS = ("sender", "recipient", "amount", "nonce", "pubkey")
+
 
 # ---------------------------------------------------------------- transactions
-def make_tx(key: KeyPair, recipient: str, amount: int, nonce: int) -> dict:
-    body = {"sender": key.public_hex, "recipient": recipient, "amount": amount, "nonce": nonce}
+def make_tx(key: AccountKey, recipient: str, amount: int, nonce: int) -> dict:
+    """Build a signed transfer transaction.
+
+    `sender` is the signer's account address (derived from its public key);
+    the public key is embedded so any node can derive the address and verify
+    the ECDSA signature without prior knowledge of the account.
+    """
+    body = {
+        "sender": key.address,
+        "recipient": recipient,
+        "amount": amount,
+        "nonce": nonce,
+        "pubkey": key.public_hex,
+    }
     tx = dict(body)
     tx["signature"] = key.sign(canonical({"chain_id": CHAIN_ID, "tx": body}))
     return tx
 
 
 def tx_sign_bytes(tx: dict) -> bytes:
-    body = {k: tx[k] for k in ("sender", "recipient", "amount", "nonce")}
+    body = {k: tx[k] for k in TX_FIELDS}
     return canonical({"chain_id": CHAIN_ID, "tx": body})
 
 
 def validate_tx(tx: dict) -> bool:
+    """Structural + ECDSA signature validation for a transaction.
+
+    State-dependent checks (nonce match, sufficient balance) are enforced
+    separately by the state machine; this covers everything verifiable
+    without state: well-formed fields, valid secp256k1 public key, address
+    binding, and a valid low-S ECDSA signature over chain_id + tx body.
+    """
     try:
-        if not isinstance(tx["amount"], int) or tx["amount"] <= 0:
+        # Shape / types.
+        if not isinstance(tx.get("amount"), int) or isinstance(tx["amount"], bool):
             return False
-        if not isinstance(tx["nonce"], int) or tx["nonce"] < 0:
+        if tx["amount"] <= 0:
             return False
-        return verify(tx["sender"], tx_sign_bytes(tx), tx["signature"])
-    except (KeyError, TypeError):
+        if not isinstance(tx.get("nonce"), int) or isinstance(tx["nonce"], bool):
+            return False
+        if tx["nonce"] < 0:
+            return False
+        if not isinstance(tx.get("sender"), str) or not tx["sender"]:
+            return False
+        if not isinstance(tx.get("recipient"), str) or not tx["recipient"]:
+            return False
+        if not isinstance(tx.get("pubkey"), str) or not tx["pubkey"]:
+            return False
+        if not isinstance(tx.get("signature"), str) or not tx["signature"]:
+            return False
+        # The embedded public key must hash to the claimed sender address.
+        if address_from_pubkey(tx["pubkey"]) != tx["sender"]:
+            return False
+        # The ECDSA signature must verify against that public key.
+        return verify_ecdsa(tx["pubkey"], tx_sign_bytes(tx), tx["signature"])
+    except (KeyError, TypeError, ValueError):
         return False
 
 

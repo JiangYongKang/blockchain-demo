@@ -5,6 +5,7 @@
   blockchain-demo start-all [--nodes N]               spawn N validator processes
   blockchain-demo tx --from A --to B --amount X     submit a transfer
   blockchain-demo status                              query all nodes
+  blockchain-demo balances                            query account balances/nonces
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from .crypto import KeyPair
+from .crypto import AccountKey, KeyPair
 from .node import Node
 from .state import GENESIS_BALANCE, GENESIS_STAKE
 from .types import CHAIN_ID, make_tx
@@ -60,12 +61,12 @@ def cmd_init(args: argparse.Namespace) -> None:
     base.mkdir(parents=True)
 
     validator_keys = [KeyPair.generate() for _ in range(args.nodes)]
-    account_keys = [KeyPair.generate() for _ in range(NUM_ACCOUNTS)]
+    account_keys = [AccountKey.generate() for _ in range(NUM_ACCOUNTS)]
 
     genesis = {
         "chain_id": CHAIN_ID,
         "validators": {k.public_hex: GENESIS_STAKE for k in validator_keys},
-        "balances": {k.public_hex: GENESIS_BALANCE for k in account_keys},
+        "balances": {k.address: GENESIS_BALANCE for k in account_keys},
     }
     (base / "genesis.json").write_text(json.dumps(genesis, indent=2))
 
@@ -97,7 +98,7 @@ def cmd_init(args: argparse.Namespace) -> None:
     if args.byzantine is not None:
         print(f"node{args.byzantine} is configured BYZANTINE (will double-sign)")
     for j, key in enumerate(account_keys):
-        print(f"  account acc{j}: {key.public_hex[:16]}… balance={GENESIS_BALANCE}")
+        print(f"  account acc{j}: {key.address} balance={GENESIS_BALANCE}")
 
 
 def cmd_run(args: argparse.Namespace) -> None:
@@ -141,17 +142,56 @@ def cmd_stop_all(args: argparse.Namespace) -> None:
 def cmd_tx(args: argparse.Namespace) -> None:
     base = Path(args.dir)
     configs = load_configs(base)
-    sender = KeyPair.from_dict(json.loads((base / "accounts" / f"acc{args.sender}.json").read_text()))
-    recipient = KeyPair.from_dict(
+    sender = AccountKey.from_dict(
+        json.loads((base / "accounts" / f"acc{args.sender}.json").read_text())
+    )
+    recipient = AccountKey.from_dict(
         json.loads((base / "accounts" / f"acc{args.recipient}.json").read_text())
     )
     nonce_resp = asyncio.run(
-        rpc_call(configs[args.node]["rpc_port"], {"cmd": "nonce", "address": sender.public_hex})
+        rpc_call(configs[args.node]["rpc_port"], {"cmd": "nonce", "address": sender.address})
     )
     nonce = nonce_resp.get("nonce", 0)
-    tx = make_tx(sender, recipient.public_hex, args.amount, nonce)
-    result = asyncio.run(rpc_call(configs[args.node]["rpc_port"], {"cmd": "submit_tx", "tx": tx}))
+    tx = make_tx(sender, recipient.address, args.amount, nonce)
+    result = asyncio.run(
+        rpc_call(configs[args.node]["rpc_port"], {"cmd": "submit_tx", "tx": tx})
+    )
     print(json.dumps(result))
+
+
+def cmd_balances(args: argparse.Namespace) -> None:
+    """Show every account's balance and nonce as seen by each node.
+
+    Honest nodes must report identical values once the transfers are
+    finalized.
+    """
+    base = Path(args.dir)
+    configs = load_configs(base)
+    accounts = {}
+    acc_dir = base / "accounts"
+    if acc_dir.exists():
+        for p in sorted(acc_dir.glob("acc*.json")):
+            key = AccountKey.from_dict(json.loads(p.read_text()))
+            accounts[p.stem] = key.address
+    addr_to_name = {addr: name for name, addr in accounts.items()}
+    for cfg in configs:
+        try:
+            resp = asyncio.run(rpc_call(cfg["rpc_port"], {"cmd": "accounts"}))
+        except OSError:
+            print(f"node{cfg['node_id']}: unreachable")
+            continue
+        if not resp.get("ok"):
+            print(f"node{cfg['node_id']}: {resp.get('error', 'error')}")
+            continue
+        accts = resp.get("accounts", {})
+        print(f"node{cfg['node_id']}:")
+        for addr in sorted(accts, key=lambda a: addr_to_name.get(a, f"zzz{a}")):
+            label = addr_to_name.get(addr, "?     ")
+            info = accts[addr]
+            print(
+                f"   {label} {addr[:12]}… balance={info['balance']:>10} "
+                f"nonce={info['nonce']}"
+            )
 
 
 def cmd_status(args: argparse.Namespace) -> None:
@@ -208,6 +248,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("status", help="print height/validators/slashing for all nodes")
     sp.set_defaults(fn=cmd_status)
+
+    sp = sub.add_parser("balances", help="print account balances and nonces on all nodes")
+    sp.set_defaults(fn=cmd_balances)
     return p
 
 

@@ -4,7 +4,10 @@ Covers the BFT requirements:
   * honest nodes finalize the same block at every height;
   * the chain keeps progressing with 1 of 4 validators down (f < n/3);
   * a double-signing validator is detected and slashed on-chain;
-  * no two conflicting blocks are ever finalized at the same height.
+  * no two conflicting blocks are ever finalized at the same height;
+  * account transfers (ECDSA-signed) move balances/nonces identically on
+    every honest node; unsigned / bad-signature / insufficient-funds /
+    bad-nonce transactions are never admitted and never finalized.
 """
 
 import asyncio
@@ -12,20 +15,20 @@ import json
 
 import pytest
 
-from blockchain_demo.crypto import KeyPair
+from blockchain_demo.crypto import AccountKey, KeyPair
 from blockchain_demo.node import Node
-from blockchain_demo.types import block_hash, make_tx
+from blockchain_demo.types import block_hash, make_block, make_proposal, make_tx
 
 FAST = {"timeout_propose": 0.3, "timeout_prevote": 0.15, "timeout_precommit": 0.15}
 
 
-def make_network(tmp_path, n=4, byzantine=(), stake=100):
+def make_network(tmp_path, n=4, byzantine=(), stake=100, n_accounts=3):
     keys = [KeyPair.generate() for _ in range(n)]
-    acct = KeyPair.generate()
+    accts = [AccountKey.generate() for _ in range(n_accounts)]
     genesis = {
         "chain_id": "test",
         "validators": {k.public_hex: stake for k in keys},
-        "balances": {acct.public_hex: 10_000},
+        "balances": {a.address: 10_000 for a in accts},
     }
     configs = []
     for i in range(n):
@@ -37,7 +40,7 @@ def make_network(tmp_path, n=4, byzantine=(), stake=100):
         (d / "config.json").write_text(json.dumps(cfg))
         (d / "key.json").write_text(json.dumps(keys[i].to_dict()))
     nodes = [Node(tmp_path / f"node{i}", configs, genesis) for i in range(n)]
-    return nodes, acct
+    return nodes, accts
 
 
 class Hub:
@@ -98,17 +101,170 @@ def quiet():
 
 def test_four_honest_nodes_finalize_same_chain(tmp_path, quiet):
     async def main():
-        nodes, acct = make_network(tmp_path)
+        nodes, accts = make_network(tmp_path)
         hub = Hub(nodes)
         task = start(hub, nodes)
         # submit a transfer through node0
-        tx = make_tx(acct, "bb" * 32, 50, 0)
+        tx = make_tx(accts[0], accts[1].address, 50, 0)
         ok, reason = nodes[0].add_tx(tx)
         assert ok, reason
         await run_until(hub, nodes, 4)
         task.cancel()
         assert_consistent(nodes)
-        assert all(n.chain_state.balances["bb" * 32] == 50 for n in nodes)
+        # transfer applied identically on every node
+        for n in nodes:
+            assert n.chain_state.balances[accts[1].address] == 10_050
+            assert n.chain_state.balances[accts[0].address] == 9_950
+            assert n.chain_state.nonces[accts[0].address] == 1
+
+    asyncio.run(main())
+
+
+def test_account_transfer_finalized_and_consistent_across_nodes(tmp_path, quiet):
+    """A valid ECDSA transfer: on finalization payer down, payee up, nonce up,
+    and ALL honest nodes agree on every account's balance and nonce."""
+    async def main():
+        nodes, accts = make_network(tmp_path)
+        hub = Hub(nodes)
+        task = start(hub, nodes)
+        a, b, c = accts
+
+        async def wait_nonce(addr, value):
+            async def _w():
+                while not all(n.chain_state.nonces.get(addr, 0) >= value for n in nodes):
+                    await asyncio.sleep(0.02)
+            await asyncio.wait_for(_w(), timeout=15)
+
+        # a -> b two sequential payments (nonce 0 then 1, each after commit),
+        # then b -> c one independent payment.
+        ok, reason = nodes[0].add_tx(make_tx(a, b.address, 100, 0))
+        assert ok, reason
+        await wait_nonce(a.address, 1)
+        ok, reason = nodes[1].add_tx(make_tx(a, b.address, 100, 1))
+        assert ok, reason
+        await wait_nonce(a.address, 2)
+        ok, reason = nodes[2].add_tx(make_tx(b, c.address, 250, 0))
+        assert ok, reason
+
+        await run_until(hub, nodes, nodes[0].height + 3)
+        task.cancel()
+        assert_consistent(nodes)
+        for n in nodes:
+            st = n.chain_state
+            assert st.balances[a.address] == 10_000 - 200
+            assert st.balances[b.address] == 10_000 + 200 - 250
+            assert st.balances[c.address] == 10_000 + 250
+            assert st.nonces[a.address] == 2
+            assert st.nonces[b.address] == 1
+            assert st.nonces[c.address] == 0
+        # cross-node agreement explicitly
+        assert len({n.chain_state.balances[a.address] for n in nodes}) == 1
+        assert len({n.chain_state.nonces[a.address] for n in nodes}) == 1
+
+    asyncio.run(main())
+
+
+def test_invalid_txs_are_never_finalized(tmp_path, quiet):
+    """Unsigned / bad-signature / insufficient-funds / bad-nonce transactions
+    must be rejected at submission and never appear in a finalized block."""
+    async def main():
+        nodes, accts = make_network(tmp_path)
+        hub = Hub(nodes)
+        task = start(hub, nodes)
+        a, b = accts[0], accts[1]
+
+        # 1. unsigned tx
+        unsigned = make_tx(a, b.address, 10, 0)
+        unsigned.pop("signature")
+        ok, _ = nodes[0].add_tx(unsigned)
+        assert not ok
+
+        # 2. invalid signature (signed by a different key)
+        forged = make_tx(AccountKey.generate(), b.address, 10, 0)
+        forged["sender"] = a.address  # claim to spend a's account
+        ok, _ = nodes[0].add_tx(forged)
+        assert not ok
+
+        # 3. insufficient funds
+        ok, reason = nodes[0].add_tx(make_tx(a, b.address, 999_999_999, 0))
+        assert not ok
+        assert "funds" in reason
+
+        # 4. nonce mismatch (future nonce)
+        ok, reason = nodes[0].add_tx(make_tx(a, b.address, 10, 42))
+        assert not ok
+        assert "nonce" in reason
+
+        # one valid tx to ensure blocks keep being produced
+        ok, _ = nodes[0].add_tx(make_tx(a, b.address, 5, 0))
+        assert ok
+
+        await run_until(hub, nodes, 5)
+        task.cancel()
+        assert_consistent(nodes)
+        # only the single valid transfer had any effect
+        for n in nodes:
+            assert n.chain_state.balances[b.address] == 10_005
+            assert n.chain_state.balances[a.address] == 9_995
+            assert n.chain_state.nonces[a.address] == 1
+            # no finalized block contains any of the rejected transactions
+            for block in n.blocks:
+                for tx in block["txs"]:
+                    assert tx["amount"] != 999_999_999
+                    assert tx.get("signature", "") != ""
+
+    asyncio.run(main())
+
+
+def test_byzantine_proposer_cannot_sneak_invalid_tx_into_block(tmp_path, quiet):
+    """Even if a Byzantine proposer crafts a block with an invalid tx, honest
+    validators must reject it (prevote nil / refuse to commit), so the invalid
+    tx is never finalized and no unbacked credit appears."""
+    async def main():
+        nodes, accts = make_network(tmp_path, byzantine=(3,))
+        honest = nodes[:3]
+        hub = Hub(nodes)
+        task = start(hub, nodes)
+
+        # Wait for the chain to finalize some blocks.
+        await run_until(hub, honest, 4)
+
+        # Craft an invalid block body: an unsigned "mint" tx that credits a
+        # random address with no corresponding debit.
+        fake_recipient = "de" * 20
+        fake_tx = {
+            "sender": "ad" * 20,
+            "recipient": fake_recipient,
+            "amount": 1_000_000,
+            "nonce": 0,
+            "pubkey": "00" * 65,
+            "signature": "00" * 70,
+        }
+        # Hand it directly to every honest node's consensus as if proposed;
+        # dry-run validation must reject it (no block commit, no state change).
+        block = make_block(
+            height=honest[0].height,
+            round_=99,
+            prev_hash=honest[0].last_block_hash,
+            timestamp=1.0,
+            proposer=nodes[3].pubkey,
+            txs=[fake_tx],
+            evidence=[],
+        )
+        proposal = make_proposal(nodes[3].key, block, 99)
+        for n in honest:
+            before = dict(n.chain_state.balances)
+            n.consensus.on_proposal(proposal)
+            # the invalid block must never be committed
+            assert n.chain_state.balances == before
+            assert n.chain_state.balances.get(fake_recipient, 0) == 0
+
+        # chain keeps advancing normally
+        await run_until(hub, honest, 7)
+        task.cancel()
+        assert_consistent(honest)
+        for n in honest:
+            assert n.chain_state.balances.get(fake_recipient, 0) == 0
 
     asyncio.run(main())
 

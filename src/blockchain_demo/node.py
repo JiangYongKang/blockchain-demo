@@ -134,6 +134,20 @@ class Node:
     def commit_block(self, block: dict, commits: list[dict]) -> None:
         if block["height"] != self.height:
             return  # stale or already committed
+        if block["prev_hash"] != self.last_block_hash:
+            self.log(f"refusing block h={block['height']}: prev_hash mismatch")
+            return
+        # Defense in depth: never apply a block whose transactions or
+        # evidence do not execute cleanly against our current state. An
+        # invalid tx (bad signature / nonce / funds) makes the whole block
+        # invalid, so it can never be finalized on an honest node — and a
+        # block that fails here cannot have earned honest precommits anyway
+        # (honest validators prevote nil for blocks that fail dry-run).
+        try:
+            self.chain_state.dry_run_block(block)
+        except StateError as exc:
+            self.log(f"refusing block h={block['height']}: {exc}")
+            return
         self.chain_state.apply_block(block)
         included = {t["signature"] for t in block["txs"]}
         self.mempool = [t for t in self.mempool if t["signature"] not in included]
@@ -147,6 +161,11 @@ class Node:
             f"COMMIT h={block['height']} block={self.last_block_hash[:8]} "
             f"txs={len(block['txs'])} evidence={len(block['evidence'])}"
         )
+        for tx in block["txs"]:
+            self.log(
+                f"  transfer {tx['sender'][:8]} -> {tx['recipient'][:8]} "
+                f"amount={tx['amount']} (nonce {tx['nonce']})"
+            )
         for ev in block["evidence"]:
             culprit = evidence_culprit(ev)
             stake = self.chain_state.validators.get(culprit, 0)
@@ -276,6 +295,21 @@ class Node:
             }
         if cmd == "balances":
             return {"ok": True, "balances": dict(self.chain_state.balances)}
+        if cmd == "accounts":
+            # Full account view: address -> {balance, nonce}. Only addresses
+            # with a balance are tracked; nonce defaults to 0 for unknown
+            # addresses (the state machine treats them the same way).
+            addrs = set(self.chain_state.balances) | set(self.chain_state.nonces)
+            return {
+                "ok": True,
+                "accounts": {
+                    a: {
+                        "balance": self.chain_state.balances.get(a, 0),
+                        "nonce": self.chain_state.nonces.get(a, 0),
+                    }
+                    for a in sorted(addrs)
+                },
+            }
         if cmd == "nonce":
             return {"ok": True, "nonce": self.chain_state.nonces.get(req.get("address"), 0)}
         if cmd == "block":

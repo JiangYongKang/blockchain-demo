@@ -96,10 +96,28 @@ class ChainState:
         )
 
     def apply_block(self, block: dict) -> None:
+        """Apply a whole block **atomically**.
+
+        Every transaction and piece of evidence is first executed against a
+        scratch copy; the resulting state is adopted only if ALL of them
+        succeed. A block containing even one invalid transaction (bad
+        signature / nonce / funds) is rejected with no partial effect, so a
+        credit can never land without its matching debit being committed in
+        the same accepted block. Honest nodes therefore derive identical
+        state from identical blocks.
+        """
+        import copy
+
+        scratch = copy.deepcopy(self)
         for tx in block["txs"]:
-            self.apply_tx(tx)
+            scratch.apply_tx(tx)
         for ev in block["evidence"]:
-            self.apply_evidence(ev)
+            scratch.apply_evidence(ev)
+        self.balances = scratch.balances
+        self.nonces = scratch.nonces
+        self.validators = scratch.validators
+        self.slashed = scratch.slashed
+        self._seen_evidence = scratch._seen_evidence
 
     def dry_run_block(self, block: dict) -> "ChainState":
         """Return a copy with the block applied; raises StateError if invalid."""
