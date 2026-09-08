@@ -24,6 +24,7 @@ from .crypto import canonical, sha256_hex
 from .merkle import SparseMerkleTree
 from .types import (
     CALL,
+    CHAIN_ID,
     DEPLOY,
     SLASH_DEN,
     SLASH_NUM,
@@ -36,6 +37,12 @@ from .types import (
 
 GENESIS_STAKE = 100
 GENESIS_BALANCE = 1_000_000
+
+# Monetary amounts are integer base units; bound them so no signed tx can carry
+# a value outside a 256-bit word (consistent with the contract VM). Python ints
+# do not overflow, but an absurdly large value must never be mistaken for a
+# legitimate amount, and floats/strings/bools must never reach arithmetic.
+MAX_AMOUNT = (1 << 256) - 1
 
 
 class StateError(Exception):
@@ -50,6 +57,12 @@ def account_key(address: str) -> str:
 
 class ChainState:
     def __init__(self, genesis: dict):
+        # The chain id binds every transaction signature to this network. It
+        # defaults to the compiled-in id for genesis docs that omit it, but an
+        # explicit genesis chain_id is authoritative: txs signed for another
+        # chain are rejected at application, so a block from a different chain
+        # (cross-chain replay) can never be committed.
+        self.chain_id: str = genesis.get("chain_id", CHAIN_ID)
         self.balances: dict[str, int] = dict(genesis["balances"])
         self.nonces: dict[str, int] = {addr: 0 for addr in self.balances}
         # Contract accounts only: address -> bytecode hex, and address -> storage.
@@ -153,25 +166,50 @@ class ChainState:
         }
 
     # ------------------------------------------------------------- execution
+    def _check_amount(self, value, allow_zero: bool = False) -> int:
+        """Validate a monetary amount from a tx.
+
+        Amounts must be plain non-negative integers within the 256-bit word
+        range. Floats are rejected (they truncate / round and could otherwise be
+        silently coerced), as are bools (which are `int` subclasses in Python),
+        strings and other types. Returns the validated int.
+        """
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise StateError("amount must be an integer")
+        if value < 0 or value > MAX_AMOUNT:
+            raise StateError("amount out of range")
+        if not allow_zero and value <= 0:
+            raise StateError("amount must be positive")
+        return value
+
     def apply_tx(self, tx: dict) -> None:
-        if not validate_tx(tx):
-            raise StateError("invalid transaction signature/shape")
+        if not validate_tx(tx, self.chain_id):
+            raise StateError("invalid transaction signature/shape (or wrong chain)")
         kind = tx_kind(tx)
         sender, nonce = tx["sender"], tx["nonce"]
+        if not isinstance(nonce, int) or isinstance(nonce, bool) or nonce < 0:
+            raise StateError("bad nonce")
         if nonce != self.nonces.get(sender, 0):
             raise StateError(f"bad nonce: want {self.nonces.get(sender, 0)}, got {nonce}")
 
         if kind == TRANSFER:
-            self._apply_transfer(sender, tx["recipient"], tx["amount"])
+            self._apply_transfer(sender, tx["recipient"], self._check_amount(tx["amount"]))
         elif kind == DEPLOY:
             self._apply_deploy(sender, tx["code"])
         elif kind == CALL:
-            self._apply_call(sender, tx["contract"], tx.get("calldata", 0), tx.get("amount", 0))
+            self._apply_call(
+                sender,
+                tx["contract"],
+                tx.get("calldata", 0),
+                self._check_amount(tx.get("amount", 0), allow_zero=True),
+            )
         else:  # unreachable: validate_tx rejects unknown kinds
             raise StateError(f"unknown tx kind {kind!r}")
         self.nonces[sender] = nonce + 1
 
     def _apply_transfer(self, sender: str, recipient: str, amount: int) -> None:
+        if not isinstance(recipient, str) or not recipient:
+            raise StateError("bad recipient")
         if self.balances.get(sender, 0) < amount:
             raise StateError("insufficient funds")
         self.balances[sender] = self.balances.get(sender, 0) - amount

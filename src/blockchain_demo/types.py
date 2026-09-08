@@ -45,18 +45,21 @@ TX_KINDS = (TRANSFER, DEPLOY, CALL)
 
 
 # ---------------------------------------------------------------- transactions
-def _sign_tx(key: AccountKey, body: dict) -> dict:
+def _sign_tx(key: AccountKey, body: dict, chain_id: str = CHAIN_ID) -> dict:
     tx = dict(body)
-    tx["signature"] = key.sign(canonical({"chain_id": CHAIN_ID, "tx": body}))
+    tx["signature"] = key.sign(canonical({"chain_id": chain_id, "tx": body}))
     return tx
 
 
-def make_tx(key: AccountKey, recipient: str, amount: int, nonce: int) -> dict:
+def make_tx(key: AccountKey, recipient: str, amount: int, nonce: int, chain_id: str = CHAIN_ID) -> dict:
     """Build a signed **transfer** transaction.
 
     `sender` is the signer's account address (derived from its public key);
     the public key is embedded so any node can derive the address and verify
     the ECDSA signature without prior knowledge of the account.
+
+    `chain_id` binds the signature to one network (default: this chain). A
+    transaction signed for a different chain_id cannot be replayed here.
     """
     body = {
         "kind": TRANSFER,
@@ -66,10 +69,10 @@ def make_tx(key: AccountKey, recipient: str, amount: int, nonce: int) -> dict:
         "nonce": nonce,
         "pubkey": key.public_hex,
     }
-    return _sign_tx(key, body)
+    return _sign_tx(key, body, chain_id)
 
 
-def make_deploy_tx(key: AccountKey, code_hex: str, nonce: int) -> dict:
+def make_deploy_tx(key: AccountKey, code_hex: str, nonce: int, chain_id: str = CHAIN_ID) -> dict:
     """Build a signed **contract-deployment** transaction.
 
     The contract's address is derived deterministically from the creator and
@@ -83,11 +86,16 @@ def make_deploy_tx(key: AccountKey, code_hex: str, nonce: int) -> dict:
         "nonce": nonce,
         "pubkey": key.public_hex,
     }
-    return _sign_tx(key, body)
+    return _sign_tx(key, body, chain_id)
 
 
 def make_call_tx(
-    key: AccountKey, contract: str, nonce: int, calldata: int = 0, amount: int = 0
+    key: AccountKey,
+    contract: str,
+    nonce: int,
+    calldata: int = 0,
+    amount: int = 0,
+    chain_id: str = CHAIN_ID,
 ) -> dict:
     """Build a signed **contract-call** transaction.
 
@@ -104,15 +112,20 @@ def make_call_tx(
         "nonce": nonce,
         "pubkey": key.public_hex,
     }
-    return _sign_tx(key, body)
+    return _sign_tx(key, body, chain_id)
 
 
 def tx_kind(tx: dict) -> str:
     return tx.get("kind", TRANSFER)
 
 
-def tx_sign_bytes(tx: dict) -> bytes:
-    """Canonical bytes covered by the ECDSA signature, per transaction kind."""
+def tx_sign_bytes(tx: dict, chain_id: str = CHAIN_ID) -> bytes:
+    """Canonical bytes covered by the ECDSA signature, per transaction kind.
+
+    `chain_id` binds a transaction to one network: the signed payload includes
+    it, so a tx from another chain (or replayed against this one) fails
+    verification.
+    """
     kind = tx_kind(tx)
     if kind == DEPLOY:
         fields = ("kind", "sender", "code", "nonce", "pubkey")
@@ -121,14 +134,14 @@ def tx_sign_bytes(tx: dict) -> bytes:
     else:  # transfer
         fields = ("kind", "sender", "recipient", "amount", "nonce", "pubkey")
     body = {f: tx[f] for f in fields if f in tx}
-    return canonical({"chain_id": CHAIN_ID, "tx": body})
+    return canonical({"chain_id": chain_id, "tx": body})
 
 
 def _is_int(x) -> bool:
     return isinstance(x, int) and not isinstance(x, bool)
 
 
-def validate_tx(tx: dict) -> bool:
+def validate_tx(tx: dict, chain_id: str = CHAIN_ID) -> bool:
     """Structural + ECDSA signature validation for a transaction.
 
     State-dependent checks (nonce match, sufficient balance, contract
@@ -136,6 +149,10 @@ def validate_tx(tx: dict) -> bool:
     machine; this covers everything verifiable without state: well-formed
     fields per kind, a valid secp256k1 public key bound to `sender`, and a
     valid low-S ECDSA signature over chain_id + the tx body.
+
+    The signature is checked against `chain_id`: a transaction signed for a
+    different network (a cross-chain replay) carries a signature over a
+    different chain_id and is rejected here.
     """
     try:
         kind = tx_kind(tx)
@@ -167,8 +184,8 @@ def validate_tx(tx: dict) -> bool:
                 return False
             if not _is_int(tx.get("amount", 0)) or tx["amount"] < 0:
                 return False
-        # The ECDSA signature must verify against that public key.
-        return verify_ecdsa(tx["pubkey"], tx_sign_bytes(tx), tx["signature"])
+        # The ECDSA signature must verify against that public key, over this chain.
+        return verify_ecdsa(tx["pubkey"], tx_sign_bytes(tx, chain_id), tx["signature"])
     except (KeyError, TypeError, ValueError):
         return False
 

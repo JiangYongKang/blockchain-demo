@@ -90,15 +90,34 @@ class Node:
 
     # ------------------------------------------------------------- mempool/evidence
     def add_tx(self, tx: dict) -> tuple[bool, str]:
-        if not validate_tx(tx):
-            return False, "invalid signature or shape"
-        if tx["nonce"] != self.chain_state.nonces.get(tx["sender"], 0):
-            return False, "bad nonce"
-        if self.chain_state.balances.get(tx["sender"], 0) < tx.get("amount", 0):
+        """Admit a transaction into the mempool and gossip it.
+
+        Rejects (without any state effect) anything that could never be
+        finalized: a bad signature/shape, a signature over a *different* chain
+        (cross-chain replay), a non-matching/consumed nonce (replay of a
+        committed tx, or out-of-order txs), and insufficient funds. The mempool
+        also enforces one pending tx per (sender, nonce): a duplicate
+        broadcast, a re-gossip, or a re-encoded copy of a tx the sender already
+        has pending is dropped instead of entering the pool twice.
+        """
+        if not validate_tx(tx, self.chain_state.chain_id):
+            return False, "invalid signature/shape or wrong chain"
+        sender, nonce = tx["sender"], tx["nonce"]
+        if nonce != self.chain_state.nonces.get(sender, 0):
+            return False, "bad nonce (stale/replayed or out of order)"
+        amount = tx.get("amount", 0) if tx.get("kind", "transfer") != "deploy" else 0
+        if not isinstance(amount, int) or isinstance(amount, bool) or amount < 0:
+            return False, "invalid amount"
+        if self.chain_state.balances.get(sender, 0) < amount:
             return False, "insufficient funds"
-        if not any(t["signature"] == tx["signature"] for t in self.mempool):
-            self.mempool.append(tx)
-            self.broadcast({"type": "tx", "data": tx})
+        # Dedup by (sender, nonce), not just signature bytes: a malleated or
+        # re-encoded signature over the same tx, or a second tx spending the
+        # same sequence number, must never sit in the pool twice — only one
+        # (sender, nonce) can ever execute.
+        if any(t["sender"] == sender and t["nonce"] == nonce for t in self.mempool):
+            return False, "duplicate transaction (sender/nonce already pending)"
+        self.mempool.append(tx)
+        self.broadcast({"type": "tx", "data": tx})
         return True, "ok"
 
     def add_evidence(self, evidence: dict) -> bool:
@@ -156,8 +175,18 @@ class Node:
             self.log(f"refusing block h={header['height']}: {exc}")
             return
         self.chain_state = post
+        # Drop txs that were included, plus any pending tx whose sequence number
+        # has been consumed (a competing same-(sender,nonce) tx that lost, or a
+        # replay of a committed tx) so a double-spend / rebroadcast can never
+        # linger in the pool and be re-proposed. Only a tx carrying the exact
+        # next nonce for its sender can still execute.
         included = {t["signature"] for t in block["txs"]}
-        self.mempool = [t for t in self.mempool if t["signature"] not in included]
+        self.mempool = [
+            t
+            for t in self.mempool
+            if t["signature"] not in included
+            and t["nonce"] == post.nonces.get(t["sender"], 0)
+        ]
         for ev in block["evidence"]:
             self.evidence_pool.pop(evidence_key(ev), None)
         self.blocks.append(block)

@@ -22,6 +22,7 @@ from blockchain_demo.crypto import AccountKey, KeyPair
 from blockchain_demo import light
 from blockchain_demo.state import ChainState
 from blockchain_demo.types import (
+    CHAIN_ID,
     PRECOMMIT,
     block_hash,
     make_block,
@@ -41,7 +42,7 @@ def _setup():
     validators = {k.public_hex: 100 for k in vals}
     accts = [AccountKey.generate() for _ in range(2)]
     genesis = {
-        "chain_id": "test",
+        "chain_id": CHAIN_ID,
         "validators": validators,
         "balances": {a.address: 10_000 for a in accts},
     }

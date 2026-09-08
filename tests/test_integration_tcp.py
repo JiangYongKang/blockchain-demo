@@ -9,7 +9,7 @@ import socket
 
 from blockchain_demo.crypto import AccountKey, KeyPair
 from blockchain_demo.node import Node
-from blockchain_demo.types import block_hash, make_tx
+from blockchain_demo.types import CHAIN_ID, block_hash, make_tx
 
 FAST = {"timeout_propose": 0.4, "timeout_prevote": 0.2, "timeout_precommit": 0.2}
 
@@ -29,7 +29,7 @@ def test_four_nodes_over_tcp_with_byzantine(tmp_path):
         sender = AccountKey.generate()
         recipient = AccountKey.generate()
         genesis = {
-            "chain_id": "test",
+            "chain_id": CHAIN_ID,
             "validators": {k.public_hex: 100 for k in keys},
             "balances": {sender.address: 5_000, recipient.address: 1_000},
         }

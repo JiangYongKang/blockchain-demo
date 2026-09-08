@@ -17,7 +17,7 @@ import pytest
 
 from blockchain_demo.crypto import AccountKey, KeyPair
 from blockchain_demo.node import Node
-from blockchain_demo.types import block_hash, make_block, make_proposal, make_tx
+from blockchain_demo.types import CHAIN_ID, block_hash, make_block, make_proposal, make_tx
 
 FAST = {"timeout_propose": 0.3, "timeout_prevote": 0.15, "timeout_precommit": 0.15}
 
@@ -26,7 +26,7 @@ def make_network(tmp_path, n=4, byzantine=(), stake=100, n_accounts=3):
     keys = [KeyPair.generate() for _ in range(n)]
     accts = [AccountKey.generate() for _ in range(n_accounts)]
     genesis = {
-        "chain_id": "test",
+        "chain_id": CHAIN_ID,
         "validators": {k.public_hex: stake for k in keys},
         "balances": {a.address: 10_000 for a in accts},
     }

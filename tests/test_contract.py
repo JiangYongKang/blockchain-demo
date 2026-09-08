@@ -23,6 +23,7 @@ from blockchain_demo.contract import (
 from blockchain_demo.crypto import AccountKey, KeyPair
 from blockchain_demo.state import ChainState, StateError
 from blockchain_demo.types import (
+    CHAIN_ID,
     make_block,
     make_call_tx,
     make_deploy_tx,
@@ -35,7 +36,7 @@ def _genesis(n_accounts=2, balance=10_000):
     vals = [KeyPair.generate() for _ in range(4)]
     accts = [AccountKey.generate() for _ in range(n_accounts)]
     genesis = {
-        "chain_id": "test",
+        "chain_id": CHAIN_ID,
         "validators": {k.public_hex: 100 for k in vals},
         "balances": {a.address: balance for a in accts},
     }

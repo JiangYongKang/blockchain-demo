@@ -3,6 +3,7 @@ import pytest
 from blockchain_demo.crypto import AccountKey, KeyPair
 from blockchain_demo.state import ChainState, StateError
 from blockchain_demo.types import (
+    CHAIN_ID,
     PRECOMMIT,
     make_block,
     make_evidence,
@@ -11,11 +12,11 @@ from blockchain_demo.types import (
 )
 
 
-def _genesis(n_validators=4, stake=100, balance=1000, n_accounts=3):
+def _genesis(n_validators=4, stake=100, balance=1000, n_accounts=3, chain_id=CHAIN_ID):
     vals = [KeyPair.generate() for _ in range(n_validators)]
     accts = [AccountKey.generate() for _ in range(n_accounts)]
     genesis = {
-        "chain_id": "test",
+        "chain_id": chain_id,
         "validators": {k.public_hex: stake for k in vals},
         "balances": {k.address: balance for k in accts},
     }
